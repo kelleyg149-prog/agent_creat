@@ -1,0 +1,38 @@
+#配置：API Key、模型实例、运行参数、checkpointer
+import os
+from dotenv import load_dotenv
+from langgraph.checkpoint.memory import InMemorySaver
+from langchain_deepseek import ChatDeepSeek
+
+#始终从脚本所在目录加载 .env，避免运行目录不同导致找不到配置
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+
+api_key = os.getenv("DEEPSEEK_API_KEY")
+if not api_key:
+    raise RuntimeError("未读取到 DEEPSEEK_API_KEY，请检查 .env 文件是否存在且变量名正确")
+
+#初始化 DeepSeek 模型
+#timeout：单次请求超时（秒），默认值较短，走代理时容易 TLS 握手超时
+#max_retries：SDK 层自动重试（指数退避），应对偶发的网络抖动
+model = ChatDeepSeek(
+    model="deepseek-chat",
+    api_key=api_key,
+    timeout=60,
+    max_retries=3
+)
+
+#失败后最多重试次数（首次调用不计入）
+MAX_RETRY = 3
+
+#送给模型的最大消息条数（防止多轮对话历史无限增长撑爆上下文窗口）
+MAX_CONTEXT_MESSAGES = 40
+
+#内存 checkpoint，用于跨轮次保留对话历史
+checkpointer = InMemorySaver()
+
+#对话线程配置（同一 thread_id 共享历史）
+config = {
+    "configurable": {
+        "thread_id": "1"
+    }
+}
