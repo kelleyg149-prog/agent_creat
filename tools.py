@@ -1,6 +1,8 @@
 #所有工具定义
 from langchain_core.tools import tool
 
+from rag_engine import rag_search as _rag_search
+
 membrane = {
     "GO-1": {
         "膜通量": 10,
@@ -48,4 +50,14 @@ def calculater(a: float, b: float):
     }
 
 
-tools = [membrane_data, calculater]
+@tool
+def rag_search(query: str):
+    """在膜分离研究论文资料库中检索与问题最相关的段落（含来源与页码）。
+
+    适用于论文资料、机理机制、表征方法、研究结论等研究类问题，
+    例如"为什么提高pH可能增强SMX截留？"。返回按相关性精排后的 Top-3 段落。
+    """
+    return _rag_search(query)
+
+
+tools = [membrane_data, calculater, rag_search]
