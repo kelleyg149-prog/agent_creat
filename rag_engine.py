@@ -76,16 +76,16 @@ def _get_rerank_model():
     """重排用 LLM：独立的无工具绑定实例，避免工具内再触发工具调用。"""
     global _rerank_model
     if _rerank_model is None:
-        api_key = os.getenv("MOONSHOT_API_KEY")
+        api_key = os.getenv("ZAI_API_KEY")
         if not api_key:
-            raise RuntimeError("未读取到 MOONSHOT_API_KEY，请检查 .env 文件")
+            raise RuntimeError("未读取到 ZAI_API_KEY，请检查 .env 文件")
         _rerank_model = ChatOpenAI(
-            model="kimi-k2.6",
+            model="glm-5.3",
             api_key=api_key,
-            base_url="https://api.moonshot.cn/v1",
+            base_url="https://open.bigmodel.cn/api/paas/v4",
             max_retries=3,
             timeout=60,
-            extra_body={"thinking": {"type": "disabled"}},
+            extra_body={"thinking": {"type": "enabled"}, "reasoning_effort": "low"},
         )
     return _rerank_model
 

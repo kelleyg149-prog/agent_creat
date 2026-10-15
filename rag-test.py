@@ -14,9 +14,9 @@ from langchain_openai import ChatOpenAI
 from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
-api_key = os.getenv("MOONSHOT_API_KEY")
+api_key = os.getenv("ZAI_API_KEY")
 if not api_key:
-    raise RuntimeError("未读取到 MOONSHOT_API_KEY，请检查 .env 文件是否存在且变量名正确")
+    raise RuntimeError("未读取到 ZAI_API_KEY，请检查 .env 文件是否存在且变量名正确")
 
 
 # 持久化路径：FAISS 索引与文档元数据统一落在脚本同目录的 data/ 下
@@ -70,14 +70,14 @@ embeddings = HuggingFaceEmbeddings(
 )
 
 
-# 2. 推理模型（重排序与最终回答共用；关闭思考模式，对齐直接问答行为）
+# 2. 推理模型（重排序与最终回答共用；GLM-5.3 强制开启思考，采用轻量推理档位）
 model = ChatOpenAI(
-    model="kimi-k2.6",
+    model="glm-5.3",
     api_key=api_key,
-    base_url="https://api.moonshot.cn/v1",
+    base_url="https://open.bigmodel.cn/api/paas/v4",
     max_retries=3,
     timeout=60,
-    extra_body={"thinking": {"type": "disabled"}},
+    extra_body={"thinking": {"type": "enabled"}, "reasoning_effort": "low"},
 )
 
 
