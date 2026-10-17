@@ -138,6 +138,7 @@ def candidate_retrieval(query, embeddings, index, documents, k=5):
         if idx == -1:
             continue
         candidates.append({
+            "idx": int(idx),
             "score": float(score),
             "document": documents[idx]
         })
@@ -190,10 +191,10 @@ def rerank(query, candidates, model, top_n=3):
 
 
 def has_sufficient_evidence(retrieved_docs):
-    """证据检查：重排后首条向量相似度不低于 0.4 才算检索质量合格。"""
+    """证据检查：重排后首条向量相似度不低于 0.6 才算检索质量合格。"""
     if not retrieved_docs:
         return False
-    return retrieved_docs[0]["score"] >= 0.4
+    return retrieved_docs[0]["score"] >= 0.6
 
 
 def build_context(retrieved_docs):
@@ -209,10 +210,11 @@ def build_context(retrieved_docs):
 
 
 def rag_search(query, top_n=3):
-    """RAG 检索问答入口：召回 → 重排 → 证据检查 → 上下文，统一返回 success/data/error 结构。
+    """RAG 检索入口：召回 → 重排，返回结构化结果（含证据分数）供 evidence_check 节点判断。
 
-    - 检索失败（资料库空、相似度过低、内部异常）返回 success=False 与原因，
-      由主 Agent 的容错链路处理（自动修正 / 人工纠错 / 自然语言说明）。
+    - 硬失败（资料库空、内部异常）返回 success=False，由主 Agent 容错链处理；
+    - 检索正常则 success=True，是否"证据充足"交由图内 evidence_check 节点
+      用向量相似度 + LLM 重排分双信号判断，本函数不做证据裁决。
     """
     try:
         embeddings, index, documents = get_engine()
@@ -226,17 +228,16 @@ def rag_search(query, top_n=3):
             }
 
         reranked = rerank(query, candidates, _get_rerank_model(), top_n=top_n)
-
-        if not has_sufficient_evidence(reranked):
-            return {
-                "success": False,
-                "data": None,
-                "error": "未检索到足够相关的资料（相似度过低），请换一种问法或先扩充资料库"
-            }
+        top = reranked[0] if reranked else {}
 
         return {
             "success": True,
-            "data": build_context(reranked),
+            "data": {
+                "context": build_context(reranked),
+                "top_vector_score": float(top.get("score", 0.0)),
+                "top_rerank_score": float(top.get("rerank_score", -1.0)),
+                "retrieved_count": len(reranked),
+            },
             "error": None
         }
     except Exception as exc:

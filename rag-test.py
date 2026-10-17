@@ -211,13 +211,13 @@ def rerank(query, candidates, top_n=3):
 
 
 def has_sufficient_evidence(retrieved_docs):
-    """证据检查：用重排后首条的向量相似度判断检索质量（0.4 为质量阈值）。"""
+    """证据检查：用重排后首条的向量相似度判断检索质量（0.6 为质量阈值）。"""
     if not retrieved_docs:
         return False
 
     best_score = retrieved_docs[0]["score"]
 
-    if best_score < 0.4:
+    if best_score < 0.6:
         return False
 
     return True
@@ -286,7 +286,7 @@ for i, c in enumerate(reranked, 1):
 
 # 7. 证据检查：检索质量不足时直接终止
 if not has_sufficient_evidence(reranked):
-    print("警告：未检索到足够相关的文档（相似度阈值为 0.4）")
+    print("警告：未检索到足够相关的文档（相似度阈值为 0.6）")
     raise SystemExit(1)
 
 # 8. 组装上下文，调用 LLM 生成最终回答

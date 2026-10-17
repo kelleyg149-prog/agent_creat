@@ -10,6 +10,10 @@ class State(MessagesState):
     tool_error_message: str
     human_approved: bool
     auto_corrected: bool
+    #检索证据状态（rag_search 专用）：None=本轮未执行检索或检索不适用
+    retrieval_success: bool | None   # rag_search 是否执行成功（返回了候选）
+    evidence_sufficient: bool | None  # 证据双信号（向量+重排分）是否达标
+    evidence_reason: str              # 证据不足的原因说明
 
 
 #各字段的初始值（集中管理，避免散落在调用方）
@@ -18,7 +22,10 @@ _STATE_DEFAULTS = {
     "retry_count": 0,
     "tool_error_message": "",
     "human_approved": False,
-    "auto_corrected": False
+    "auto_corrected": False,
+    "retrieval_success": None,
+    "evidence_sufficient": None,
+    "evidence_reason": ""
 }
 
 

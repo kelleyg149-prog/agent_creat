@@ -4,6 +4,7 @@ import uuid
 from typing import Literal
 
 from langgraph.types import Command, interrupt
+from langgraph.graph import END
 from langgraph.prebuilt import ToolNode
 from langchain_core.messages import AIMessage, RemoveMessage, ToolMessage
 
@@ -59,7 +60,7 @@ def create_check_tool(max_retry):
                     "retry_count": 0,
                     "auto_corrected": False
                 },
-                goto="llm"
+                goto="evidence_check"
             )
 
         if state["retry_count"] >= max_retry:
@@ -339,3 +340,98 @@ def human_check(state) -> Command[Literal["tool_node", "llm"]]:
                 ]
             },
             goto="tool_node")
+
+
+#证据检查节点工厂：向量相似度 + LLM 重排分双信号判断检索证据是否充足
+def create_evidence_check(vector_threshold=0.6, rerank_threshold=5.0):
+    """只针对 rag_search 工具；其他工具（membrane_data/calculater）直接放行。
+
+    双信号：
+    - 向量相似度（FAISS）：证据与问题的语义相似度下限
+    - 重排分（LLM）：模型对证据与问题相关性的判断（0-10）
+    重排分缺失（<0，即 LLM 重排回退）时不阻塞，退化为只依赖向量信号。
+
+    判断结果写入 State 字段（retrieval_success / evidence_sufficient / evidence_reason），
+    供 no_evidence 节点读取，避免两处重复解析工具结果。
+    """
+    def evidence_check(state) -> Command[Literal["llm", "no_evidence"]]:
+        #取本轮最后一条工具执行结果
+        last_tool = None
+        for msg in reversed(state["messages"]):
+            if msg.type == "tool":
+                last_tool = msg
+                break
+
+        #非 rag_search：证据检查不适用，直接放行给 LLM
+        if last_tool is None or last_tool.name != "rag_search":
+            return Command(
+                update={
+                    "retrieval_success": None,
+                    "evidence_sufficient": None,
+                    "evidence_reason": ""
+                },
+                goto="llm"
+            )
+
+        try:
+            result = json.loads(last_tool.content)
+        except Exception:
+            return Command(
+                update={
+                    "retrieval_success": None,
+                    "evidence_sufficient": None,
+                    "evidence_reason": "检索结果解析失败"
+                },
+                goto="llm"
+            )
+
+        #硬失败（资料库空等）：已由 check_node 容错链处理，这里只记录状态并放行收尾
+        if not result.get("success"):
+            return Command(
+                update={
+                    "retrieval_success": False,
+                    "evidence_sufficient": None,
+                    "evidence_reason": result.get("error", "检索失败")
+                },
+                goto="llm"
+            )
+
+        data = result.get("data") or {}
+        vector_score = data.get("top_vector_score", 0.0)
+        rerank_score = data.get("top_rerank_score", -1.0)
+
+        vector_ok = vector_score >= vector_threshold
+        rerank_ok = rerank_score >= rerank_threshold if rerank_score >= 0 else True
+        passed = vector_ok and rerank_ok
+
+        #生成不足原因：列出未达标的信号
+        reasons = []
+        if not vector_ok:
+            reasons.append(f"语义相似度 {vector_score:.2f}（阈值 {vector_threshold}）")
+        if not rerank_ok:
+            reasons.append(f"相关性评分 {rerank_score:.1f}/10（阈值 {rerank_threshold}）")
+        reason = "、".join(reasons) if reasons else ""
+
+        return Command(
+            update={
+                "retrieval_success": True,
+                "evidence_sufficient": passed,
+                "evidence_reason": reason
+            },
+            goto="llm" if passed else "no_evidence"
+        )
+    return evidence_check
+
+
+#证据不足时的友情提示节点：读取 State 证据字段生成提示，不额外调用 LLM
+def no_evidence(state) -> Command[Literal["__end__"]]:
+    reason = state.get("evidence_reason") or "检索证据未达标"
+    hint = (
+        "抱歉，当前论文资料库中没有检索到足够相关的资料来回答这个问题"
+        f"（{reason}）。\n"
+        "建议换个问法，或先用 rag-test.py --add 补充相关资料后再试。"
+    )
+    return Command(
+        update={"messages": [AIMessage(content=hint)]},
+        goto=END
+    )

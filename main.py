@@ -83,7 +83,10 @@ def main():
             "messages": [{"role": "user", "content": user_input}],
             "tool_error": False,
             "retry_count": 0,
-            "auto_corrected": False
+            "auto_corrected": False,
+            "retrieval_success": None,
+            "evidence_sufficient": None,
+            "evidence_reason": ""
         }, config)
         if result is None:
             print("（本轮请求未完成，请稍后重新提问）")
