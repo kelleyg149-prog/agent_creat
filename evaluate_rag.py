@@ -9,6 +9,10 @@ from rag_engine import (
     rerank,
     _get_rerank_model,
 )
+from rag_config import (
+    RAG_CANDIDATE_K,
+    EVIDENCE_VECTOR_THRESHOLD,
+)
 
 
 # 评估集：query -> 相关文档索引集合（0=pH去质子化 1=静电排斥 2=尺寸筛分 3=XPS 4=跨膜压力）
@@ -67,7 +71,7 @@ def main():
     fallback_count = 0
 
     for qi, (query, relevant) in enumerate(QUERIES, 1):
-        candidates = candidate_retrieval(query, embeddings, index, documents, k=5)
+        candidates = candidate_retrieval(query, embeddings, index, documents, k=RAG_CANDIDATE_K)
         recall_order = [c["idx"] for c in candidates]
 
         # 评估用全量重排（top_n=5 看完整排序）；主链路仍为 top_n=3
@@ -86,9 +90,9 @@ def main():
             pos = [str(i + 1) for i, idx in enumerate(order) if idx in relevant]
             return ", ".join(f"相关@#{p}" for p in pos) if pos else "未命中"
 
-        # 证据检查模拟（重排后首条向量相似度 >= 0.6）：无关 query 应被拦截
+        # 证据检查模拟（重排后首条向量相似度 >= EVIDENCE_VECTOR_THRESHOLD）：无关 query 应被拦截
         top_score = reranked[0]["score"] if reranked else 0.0
-        evidence_pass = top_score >= 0.6
+        evidence_pass = top_score >= EVIDENCE_VECTOR_THRESHOLD
 
         print(f"[{qi}] {query}")
         print(f"     相关文档索引：{sorted(relevant)}")

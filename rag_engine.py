@@ -1,16 +1,17 @@
-"""RAG 检索引擎：供主 Agent 的 rag_search 工具调用。
+"""RAG 检索基础能力：惰性加载 embedding/索引、FAISS 召回、LLM 重排、上下文组装。
 
-链路与 rag-test.py 一致（FAISS 召回 → LLM 重排 → 证据检查 → 上下文组装），
-关键差异：
-- 惰性加载：embedding 模型（约 470MB）与索引只在首次调用 rag_search 时初始化，
+供 RAG 子图（rag_subgraph.py）与独立脚本（rag-test.py / evaluate_rag.py）共用：
+- 惰性加载：embedding 模型（约 470MB）与索引只在首次检索时初始化，
   避免主 Agent 一启动就加载大模型
 - 重排用独立的无工具绑定 LLM 实例，防止工具内再次触发工具调用形成循环
-- 返回结构统一为 {"success": bool, "data": str|None, "error": str|None}，与 tools.py 现有工具一致
+- 证据裁决与答案生成已上移到 RAG 子图（rag_subgraph.py），本模块不再承担
 """
 import faiss
 import json
 import numpy as np
 import os
+
+from rag_config import RAG_CANDIDATE_K, RAG_RERANK_TOP_N
 
 # 强制离线加载 embedding 模型（必须在 import langchain_huggingface 之前设置）
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
@@ -30,40 +31,7 @@ INDEX_PATH = os.path.join(DATA_DIR, "faiss_index.bin")
 DOCS_PATH = os.path.join(DATA_DIR, "documents.json")
 
 
-# 种子文档：仅当 data/ 下还没有持久化索引时用于首次建库（与 rag-test.py 的种子一致）
-SEED_DOCUMENTS = [
-    {
-        "text": "在较高pH条件下，SMX更容易发生去质子化，并表现出更强的负电性。",
-        "source": "paper_01.pdf",
-        "page": 8,
-        "section": "3.3 Effect of pH"
-    },
-    {
-        "text": "GO膜表面通常带负电，因此可能与阴离子型污染物产生静电排斥作用。",
-        "source": "paper_01.pdf",
-        "page": 9,
-        "section": "3.4 Rejection mechanism"
-    },
-    {
-        "text": "膜孔径和污染物分子尺寸会影响尺寸筛分作用。",
-        "source": "paper_02.pdf",
-        "page": 5,
-        "section": "3.2 Size exclusion"
-    },
-    {
-        "text": "XPS可以用于分析膜表面的元素组成和化学键状态。",
-        "source": "paper_03.pdf",
-        "page": 4,
-        "section": "2.4 Characterization"
-    },
-    {
-        "text": "提高跨膜压力通常会增加膜的水通量。",
-        "source": "paper_04.pdf",
-        "page": 7,
-        "section": "3.1 Flux"
-    }
-]
-
+from seed_documents import SEED_DOCUMENTS
 
 # 惰性单例：模块导入时不加载任何大对象
 _embeddings = None
@@ -128,7 +96,7 @@ def get_engine():
     return _embeddings, _index, _documents
 
 
-def candidate_retrieval(query, embeddings, index, documents, k=5):
+def candidate_retrieval(query, embeddings, index, documents, k=RAG_CANDIDATE_K):
     """召回阶段（粗排）：FAISS 检索 Top-k 候选，不做阈值过滤（交给重排后处理）。"""
     query_vector = np.array([embeddings.embed_query(query)], dtype="float32")
     scores, indices = index.search(query_vector, k=k)
@@ -145,7 +113,7 @@ def candidate_retrieval(query, embeddings, index, documents, k=5):
     return candidates
 
 
-def rerank(query, candidates, model, top_n=3):
+def rerank(query, candidates, model, top_n=RAG_RERANK_TOP_N):
     """精排阶段（Reranker）：LLM 按候选与问题的相关性打分排序（LLM-as-Reranker）。"""
     if len(candidates) <= 1:
         return candidates
@@ -190,13 +158,6 @@ def rerank(query, candidates, model, top_n=3):
     return reranked[:top_n]
 
 
-def has_sufficient_evidence(retrieved_docs):
-    """证据检查：重排后首条向量相似度不低于 0.6 才算检索质量合格。"""
-    if not retrieved_docs:
-        return False
-    return retrieved_docs[0]["score"] >= 0.6
-
-
 def build_context(retrieved_docs):
     """组装上下文文本：来源 + 页码 + 章节 + 正文（供模型阅读，不含调试分数）。"""
     context_parts = []
@@ -207,42 +168,3 @@ def build_context(retrieved_docs):
             f"内容：{doc['text']}"
         )
     return "\n\n---\n\n".join(context_parts)
-
-
-def rag_search(query, top_n=3):
-    """RAG 检索入口：召回 → 重排，返回结构化结果（含证据分数）供 evidence_check 节点判断。
-
-    - 硬失败（资料库空、内部异常）返回 success=False，由主 Agent 容错链处理；
-    - 检索正常则 success=True，是否"证据充足"交由图内 evidence_check 节点
-      用向量相似度 + LLM 重排分双信号判断，本函数不做证据裁决。
-    """
-    try:
-        embeddings, index, documents = get_engine()
-        candidates = candidate_retrieval(query, embeddings, index, documents, k=5)
-
-        if not candidates:
-            return {
-                "success": False,
-                "data": None,
-                "error": "资料库为空，未检索到任何候选文档"
-            }
-
-        reranked = rerank(query, candidates, _get_rerank_model(), top_n=top_n)
-        top = reranked[0] if reranked else {}
-
-        return {
-            "success": True,
-            "data": {
-                "context": build_context(reranked),
-                "top_vector_score": float(top.get("score", 0.0)),
-                "top_rerank_score": float(top.get("rerank_score", -1.0)),
-                "retrieved_count": len(reranked),
-            },
-            "error": None
-        }
-    except Exception as exc:
-        return {
-            "success": False,
-            "data": None,
-            "error": f"RAG 检索失败：{exc}"
-        }

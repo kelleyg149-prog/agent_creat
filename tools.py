@@ -1,32 +1,38 @@
 #所有工具定义
+import json
+import os
+
 from langchain_core.tools import tool
 
-from rag_engine import rag_search as _rag_search
+from rag_subgraph import rag_subgraph
 
-#膜实验数据表：字段为 膜通量(L·m⁻²·h⁻¹) / 电压(V) / 离子通量
-membrane = {
-    "GO-1": {
-        "膜通量": 10,
-        "电压": 3.0,
-        "离子通量": 56
-    },
-    "GO-2": {
-        "膜通量": 20,
-        "电压": 3.0,
-        "离子通量": 56
-    },
-    "GO-3": {
-        "膜通量": 30,
-        "电压": 3.0,
-        "离子通量": 56
-    }
+#========== 膜数据加载（数据外置） ==========
+#膜数据存于项目根 membrane.json（业务资产，入库；data/ 仍 gitignored 存运行产物）
+#每次查询实时读文件：改 JSON 立即生效，无需重启 Agent
+MEMBRANE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "membrane.json")
+
+#内置默认数据：仅当 membrane.json 不存在时用于首次生成（与 RAG 的 SEED_DOCUMENTS 同理）
+_DEFAULT_MEMBRANE = {
+    "GO-1": {"膜通量": 10, "电压": 3.0, "离子通量": 56},
+    "GO-2": {"膜通量": 20, "电压": 3.0, "离子通量": 56},
+    "GO-3": {"膜通量": 30, "电压": 3.0, "离子通量": 56}
 }
+
+
+def _load_membrane() -> dict:
+    """读取膜数据表；文件不存在时用内置默认生成一份，保证首次运行可用。"""
+    if not os.path.exists(MEMBRANE_PATH):
+        with open(MEMBRANE_PATH, "w", encoding="utf-8") as f:
+            json.dump(_DEFAULT_MEMBRANE, f, ensure_ascii=False, indent=2)
+    with open(MEMBRANE_PATH, encoding="utf-8") as f:
+        return json.load(f)
 
 
 #========== 膜数据查询逻辑封装 ==========
 
 def _query_by_name(mem_name: str) -> dict:
     """按膜编号精确查询。"""
+    membrane = _load_membrane()
     mem_name = mem_name.upper()
     if mem_name in membrane:
         return {"success": True, "data": membrane[mem_name], "error": None}
@@ -35,6 +41,7 @@ def _query_by_name(mem_name: str) -> dict:
 
 def _query_by_field(field: str, value: float) -> dict:
     """按数据字段精确筛选：返回该字段值等于 value 的所有膜。"""
+    membrane = _load_membrane()
     matched = [
         {"膜编号": name, **data}
         for name, data in membrane.items()
@@ -48,6 +55,7 @@ def _query_by_field(field: str, value: float) -> dict:
 def _query_by_range(field: str, op: str, value: float) -> dict:
     """按数值范围筛选：op 支持 >、>=、<、<=、=。"""
     import operator
+    membrane = _load_membrane()
     ops = {
         ">": operator.gt, ">=": operator.ge,
         "<": operator.lt, "<=": operator.le,
@@ -109,12 +117,25 @@ def calculater(a: float, b: float):
 
 @tool
 def rag_search(query: str):
-    """在膜分离研究论文资料库中检索与问题最相关的段落（含来源与页码）。
+    """在膜分离研究论文资料库中检索并回答与问题最相关的资料（含来源与页码）。
 
     适用于论文资料、机理机制、表征方法、研究结论等研究类问题，
-    例如"为什么提高pH可能增强SMX截留？"。返回按相关性精排后的 Top-3 段落。
+    例如"为什么提高pH可能增强SMX截留？"。
+    内部由 RAG 子图完成：召回 → 重排 → 证据检查 → 生成答案（或证据不足时给出提示）。
     """
-    return _rag_search(query)
+    result = rag_subgraph.invoke({"query": query})
+    return {
+        "success": True,
+        "data": {
+            "answer": result["answer"],
+            "top_vector_score": float(result["vector_score"]),
+            "top_rerank_score": float(result["rerank_score"]),
+            "evidence_ok": bool(result["evidence_ok"]),
+            "evidence_reason": result["evidence_reason"],
+            "retrieved_count": len(result["reranked"]),
+        },
+        "error": None
+    }
 
 
 tools = [membrane_data, calculater, rag_search]

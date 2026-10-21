@@ -6,7 +6,7 @@ from state import State
 from nodes import (
     create_llm_node, create_auto_correct_node,
     create_check_tool, create_retry_node, create_tool_node,
-    create_evidence_check, no_evidence,
+    create_evidence_check,
     human_check, router
 )
 
@@ -26,7 +26,6 @@ builder.add_node("auto_correct", auto_correct_node)
 builder.add_node("retry", retry_node)
 builder.add_node("human_check", human_check)
 builder.add_node("evidence_check", evidence_check)
-builder.add_node("no_evidence", no_evidence)
 
 builder.add_edge(START, "llm")
 

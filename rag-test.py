@@ -14,6 +14,11 @@ from langchain_openai import ChatOpenAI
 from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
+from rag_config import (
+    RAG_CANDIDATE_K, RAG_RERANK_TOP_N,
+    EVIDENCE_VECTOR_THRESHOLD, EVIDENCE_RERANK_THRESHOLD
+)
+
 api_key = os.getenv("ZAI_API_KEY")
 if not api_key:
     raise RuntimeError("未读取到 ZAI_API_KEY，请检查 .env 文件是否存在且变量名正确")
@@ -24,41 +29,7 @@ DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 INDEX_PATH = os.path.join(DATA_DIR, "faiss_index.bin")
 DOCS_PATH = os.path.join(DATA_DIR, "documents.json")
 
-
-# 种子文档：仅当 data/ 下还没有持久化索引时用于首次建库；
-# 建库后数据以 data/documents.json 为准，增删文档直接改该文件或用 --add 增量添加
-SEED_DOCUMENTS = [
-    {
-        "text": "在较高pH条件下，SMX更容易发生去质子化，并表现出更强的负电性。",
-        "source": "paper_01.pdf",
-        "page": 8,
-        "section": "3.3 Effect of pH"
-    },
-    {
-        "text": "GO膜表面通常带负电，因此可能与阴离子型污染物产生静电排斥作用。",
-        "source": "paper_01.pdf",
-        "page": 9,
-        "section": "3.4 Rejection mechanism"
-    },
-    {
-        "text": "膜孔径和污染物分子尺寸会影响尺寸筛分作用。",
-        "source": "paper_02.pdf",
-        "page": 5,
-        "section": "3.2 Size exclusion"
-    },
-    {
-        "text": "XPS可以用于分析膜表面的元素组成和化学键状态。",
-        "source": "paper_03.pdf",
-        "page": 4,
-        "section": "2.4 Characterization"
-    },
-    {
-        "text": "提高跨膜压力通常会增加膜的水通量。",
-        "source": "paper_04.pdf",
-        "page": 7,
-        "section": "3.1 Flux"
-    }
-]
+from seed_documents import SEED_DOCUMENTS
 
 
 # 1. 初始化 Embedding 模型（多语言 MiniLM，384 维；normalize_embeddings=True 配合后续 IndexFlatIP 实现余弦相似度）
@@ -130,7 +101,7 @@ def add_documents(new_docs):
     return documents, index
 
 
-def candidate_retrieval(query, k=5):
+def candidate_retrieval(query, k=RAG_CANDIDATE_K):
     """召回阶段（粗排）：FAISS 向量检索 Top-k 候选。
 
     只做召回、不做阈值过滤——弱相关但有价值的候选交给 rerank 精排后再淘汰，
@@ -155,7 +126,7 @@ def candidate_retrieval(query, k=5):
     return candidates
 
 
-def rerank(query, candidates, top_n=3):
+def rerank(query, candidates, top_n=RAG_RERANK_TOP_N):
     """精排阶段（Reranker）：对候选与问题的相关性重排序。
 
     标准 Reranker 是 cross-encoder（如 BGE-reranker），需单独模型权重；
@@ -211,13 +182,13 @@ def rerank(query, candidates, top_n=3):
 
 
 def has_sufficient_evidence(retrieved_docs):
-    """证据检查：用重排后首条的向量相似度判断检索质量（0.6 为质量阈值）。"""
+    """证据检查：用重排后首条的向量相似度判断检索质量（EVIDENCE_VECTOR_THRESHOLD 为质量阈值）。"""
     if not retrieved_docs:
         return False
 
     best_score = retrieved_docs[0]["score"]
 
-    if best_score < 0.6:
+    if best_score < EVIDENCE_VECTOR_THRESHOLD:
         return False
 
     return True
@@ -272,21 +243,21 @@ if "--add" in sys.argv:
 query = "为什么提高pH可能增强SMX截留？"
 
 
-# 5. 召回 Top-5 候选（FAISS 粗排，不做阈值过滤）
-candidates = candidate_retrieval(query, k=5)
-print("\n【召回阶段】FAISS Top-5：")
+# 5. 召回 Top-K 候选（FAISS 粗排，不做阈值过滤）
+candidates = candidate_retrieval(query, k=RAG_CANDIDATE_K)
+print(f"\n【召回阶段】FAISS Top-{RAG_CANDIDATE_K}：")
 for i, c in enumerate(candidates, 1):
     print(f"  #{i}  向量 {c['score']:.4f}  {c['document']['text']}")
 
-# 6. LLM 重排，精取 Top-3
-reranked = rerank(query, candidates, top_n=3)
-print("\n【重排阶段】Reranker Top-3：")
+# 6. LLM 重排，精取 Top-N
+reranked = rerank(query, candidates, top_n=RAG_RERANK_TOP_N)
+print(f"\n【重排阶段】Reranker Top-{RAG_RERANK_TOP_N}：")
 for i, c in enumerate(reranked, 1):
     print(f"  #{i}  重排分 {c.get('rerank_score', '—')}  向量 {c['score']:.4f}  {c['document']['text']}")
 
 # 7. 证据检查：检索质量不足时直接终止
 if not has_sufficient_evidence(reranked):
-    print("警告：未检索到足够相关的文档（相似度阈值为 0.6）")
+    print(f"警告：未检索到足够相关的文档（相似度阈值为 {EVIDENCE_VECTOR_THRESHOLD}）")
     raise SystemExit(1)
 
 # 8. 组装上下文，调用 LLM 生成最终回答
