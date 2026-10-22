@@ -1,7 +1,8 @@
 #配置：API Key、模型实例、运行参数、checkpointer
 import os
+import sqlite3
 from dotenv import load_dotenv
-from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
 from langchain_openai import ChatOpenAI
 
 from tools import tools
@@ -37,10 +38,19 @@ MAX_RETRY = 3
 #送给模型的最大消息条数（防止多轮对话历史无限增长撑爆上下文窗口）
 MAX_CONTEXT_MESSAGES = 40
 
-#内存 checkpoint，用于跨轮次保留对话历史
-checkpointer = InMemorySaver()
+#SQLite checkpointer：对话历史持久化到本地文件（跨进程不丢）
+#- 文件放 data/（运行产物，已 gitignore，不入库；含对话内容，删除即清空记忆）
+#- check_same_thread=False：LangGraph 内部可能多线程访问 sqlite，Python 默认禁止跨线程
+_here_dir = os.path.dirname(os.path.abspath(__file__))
+_checkpoint_dir = os.path.join(_here_dir, "data")
+os.makedirs(_checkpoint_dir, exist_ok=True)
+_checkpoint_conn = sqlite3.connect(
+    os.path.join(_checkpoint_dir, "checkpoint.sqlite"),
+    check_same_thread=False
+)
+checkpointer = SqliteSaver(_checkpoint_conn)
 
-#对话线程配置（同一 thread_id 共享历史）
+#对话线程配置（同一 thread_id 共享历史；换 thread_id = 开新对话）
 config = {
     "configurable": {
         "thread_id": "1"

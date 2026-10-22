@@ -27,7 +27,7 @@
 | 文件 | 职责 | 状态 |
 |---|---|---|
 | `main.py` | 程序入口：持续对话循环；`safe_invoke()` 限流退避重试（429 后等 5s 重试 3 次）+ 认证/连接/格式/兜底异常友好提示；处理 `interrupt` 挂起的人工审批，循环 resume | 已提交，工作区有未提交改动 |
-| `config.py` | 配置中心：加载 `.env`、创建智谱 GLM-5.3 模型实例、`bind_tools`、`MAX_RETRY=3`、`MAX_CONTEXT_MESSAGES=40`、内存 checkpointer、`thread_id` | 已提交（更换 api 提交） |
+| `config.py` | 配置中心：加载 `.env`、创建智谱 GLM-5.3 模型实例、`bind_tools`、`MAX_RETRY=3`、`MAX_CONTEXT_MESSAGES=40`、**SQLite checkpointer（`data/checkpoint.sqlite`，跨进程持久化）**、`thread_id` | 已提交（更换 api 提交） |
 | `graph.py` | LangGraph 图：注册节点（llm / tool_node / check_node / auto_correct / retry / human_check / **evidence_check**）、条件边、`compile(checkpointer)` | 工作区有未提交改动 |
 | `nodes.py` | 全部节点实现（工厂函数模式）：llm / check_tool / auto_correct / retry / human_check / router / **create_evidence_check（RAG 答案透传：读子图产出的 answer 直接返回，写 State 证据字段）** | 同上 |
 | `state.py` | `State(MessagesState)` 扩展字段（含 3 个证据字段）+ `init_state()` 统一初始化 | 同上 |
@@ -39,7 +39,6 @@
 | `seed_documents.py` | **种子文档共享模块**：`SEED_DOCUMENTS`（5 条）唯一出处，`rag-test.py` 与 `rag_engine.py` 共同引用，消除两份种子漂移 | 未入库 |
 | `rag-test.py` | RAG 检索问答独立脚本（召回+重排+索引持久化+`--add` 增量；参数引用 `rag_config`，阈值 0.6 已与 engine 对齐） | 未入库 |
 | `evaluate_rag.py` | 检索质量评估脚本：12 query（8 正例+2 弱相关+2 无关），Hit@1/Hit@3/Hit@5/MRR；参数引用 `rag_config` | 未入库 |
-| `11.py` | hello world 极简脚本（学习/测试用） | 未入库 |
 | `.env` | API Key（已 gitignore） | — |
 
 ## 4. 架构与执行流程
@@ -98,7 +97,7 @@ RAG 子图（rag_subgraph，由 rag_search 工具调用）：
 5. **消息裁剪保配对**：`MAX_CONTEXT_MESSAGES=40` 窗口裁剪时，跳过开头的 `ToolMessage`，避免裁掉它对应的 `AIMessage.tool_calls` 导致 API 400。
 6. **重试调用必须新 id**：原 tool_call 已执行完毕，重试时以 `call_retry_xxx` 新 id 追加，不能复用旧 id。
 7. **模型配置**：智谱 GLM-5.3 强制思考（`extra_body` 传 `thinking.type=enabled` + `reasoning_effort=low`）；`timeout=60`（防代理 TLS 握手超时）+ `max_retries=3`（SDK 指数退避）。
-8. **对话历史持久化**：内存 checkpointer 按 `thread_id="1"` 跨轮次保留历史；每轮 `graph.invoke` 只注入本轮 user 消息，并重置重试与证据相关字段。
+8. **对话历史持久化（SQLite）**：checkpointer 由 `InMemorySaver` 升级为 `SqliteSaver`（依赖 `langgraph-checkpoint-sqlite` 包），历史写入 `data/checkpoint.sqlite`（已 gitignore），**跨进程记忆不丢**（实测：进程 1 记住名字，进程 2 仍能答出）；同一 `thread_id` 共享历史、换 `thread_id` 开新对话；连接需 `check_same_thread=False`（LangGraph 内部多线程访问 sqlite）；删除该文件即清空记忆。每轮 `graph.invoke` 只注入本轮 user 消息，并重置重试与证据相关字段。
 9. **evidence_check 演进三步**：证据判断从 `rag_engine` 内部 → 主图独立节点（State 字段驱动：`retrieval_success` / `evidence_sufficient` / `evidence_reason`）→ **RAG 子图内节点**（`rag_subgraph.evidence_check_node`）。当前子图内完成 召回→重排→双信号裁决→生成/提示，主图 `evidence_check` 只透传子图 answer 并写 State 字段，不再重复裁决。
 10. **多模式工具 docstring 驱动**：`membrane_data` 一个工具支持三种查询（按编号 / 按字段精确筛选 / 按数值范围），通过 docstring 写清用法示例，LLM 按问题自动选择模式与参数（实测三模式均正确调用）。
 11. **safe_invoke 兜底**：`graph.invoke` 统一封装——限流（429）退避重试 3 次每次 5s，认证/连接/请求格式/兜底异常友好提示返回 None，程序永不因 API 异常崩溃。
@@ -112,7 +111,7 @@ RAG 子图（rag_subgraph，由 rag_search 工具调用）：
 - `M`：`evaluate_rag.py`、`graph.py`、`nodes.py`、`rag-test.py`、`rag_engine.py`、`tools.py`、`PROJECT_SUMMARY.md`（参数集中 + 膜数据外置 + 种子去重 + RAG 子图化）
 - `??`：`rag_config.py`（RAG 参数配置模块）、`rag_subgraph.py`（RAG 子图）、`membrane.json`（膜数据）、`seed_documents.py`（种子文档共享模块）
 
-已完成能力：模块化 LangGraph 图、工具审批流、三级失败容错、消息窗口裁剪、跨轮次记忆、RAG 全链路（召回→重排→证据检查→生成/提示，已子图化）、检索质量评估、膜数据三模式查询、API 异常兜底、RAG 参数集中配置、膜数据外置、种子文档去重。
+已完成能力：模块化 LangGraph 图、工具审批流、三级失败容错、消息窗口裁剪、**SQLite 持久化记忆（跨进程不丢）**、RAG 全链路（召回→重排→证据检查→生成/提示，已子图化）、检索质量评估、膜数据三模式查询、API 异常兜底、RAG 参数集中配置、膜数据外置、种子文档去重。
 
 ## 7. RAG 链路优化进度
 
