@@ -1,6 +1,6 @@
 #LangGraph 流程：注册节点、边，编译图
 from langgraph.graph import StateGraph, START, END
-from config import checkpointer, model_with_tool, MAX_RETRY, MAX_CONTEXT_MESSAGES
+from config import checkpointer, model, model_with_tool, MAX_RETRY, MAX_CONTEXT_MESSAGES, COMPRESS_KEEP_RECENT
 from tools import tools
 from state import State
 from nodes import (
@@ -11,7 +11,7 @@ from nodes import (
 )
 
 #通过工厂函数注入依赖，得到实际的节点函数
-llm_node = create_llm_node(model_with_tool, MAX_CONTEXT_MESSAGES)
+llm_node = create_llm_node(model_with_tool, MAX_CONTEXT_MESSAGES, model, COMPRESS_KEEP_RECENT)
 auto_correct_node = create_auto_correct_node(model_with_tool, MAX_CONTEXT_MESSAGES)
 check_tool = create_check_tool(MAX_RETRY)
 retry_node = create_retry_node()

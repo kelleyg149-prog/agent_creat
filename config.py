@@ -38,6 +38,9 @@ MAX_RETRY = 3
 #送给模型的最大消息条数（防止多轮对话历史无限增长撑爆上下文窗口）
 MAX_CONTEXT_MESSAGES = 40
 
+#上下文压缩：超限时保留最近 N 条，更早的消息用 LLM 压缩成摘要（替代硬裁剪，避免丢关键事实）
+COMPRESS_KEEP_RECENT = 20
+
 #SQLite checkpointer：对话历史持久化到本地文件（跨进程不丢）
 #- 文件放 data/（运行产物，已 gitignore，不入库；含对话内容，删除即清空记忆）
 #- check_same_thread=False：LangGraph 内部可能多线程访问 sqlite，Python 默认禁止跨线程

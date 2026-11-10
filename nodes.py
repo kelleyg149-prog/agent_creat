@@ -9,6 +9,7 @@ from langgraph.prebuilt import ToolNode
 from langchain_core.messages import AIMessage, RemoveMessage, ToolMessage
 
 from rag_config import EVIDENCE_VECTOR_THRESHOLD, EVIDENCE_RERANK_THRESHOLD
+from memory import compress_context
 
 
 #工具调用节点工厂：接收工具列表，返回 ToolNode 实例
@@ -105,16 +106,36 @@ def create_check_tool(max_retry):
     return check_tool
 
 
-#llm节点工厂：接收绑定工具的模型和消息窗口大小，返回实际的 llm 节点函数
-def create_llm_node(model_with_tool, max_context_messages):
+#llm节点工厂：接收绑定工具的模型、消息窗口大小，可选摘要模型与保留条数
+def create_llm_node(model_with_tool, max_context_messages, summary_model=None, keep_recent=20):
     trim_for_model = create_trim_for_model(max_context_messages)
 
     def llm_node(state):
-        response = model_with_tool.invoke(
-            trim_for_model(state["messages"])
-        )
+        """
+        消息超限时优先压缩（摘要+写回 State 删除旧消息），压缩失败回退硬裁剪。
+        返回的 messages 里 RemoveMessage 会按 add_messages 的 reducer 删除对应旧消息，
+        摘要 SystemMessage 与模型回复一起追加，保证 State 持续精简。
+        """
+        messages = state["messages"]
+        updates = []
+        if summary_model is not None and len(messages) > max_context_messages:
+            try:
+                result = compress_context(messages, max_context_messages, keep_recent, summary_model)
+                if result:
+                    removed, summary_message = result
+                    tail = list(messages[len(removed):])
+                    messages = [summary_message] + tail
+                    updates = [RemoveMessage(id=m.id) for m in removed if getattr(m, "id", None)]
+                    updates.append(summary_message)
+                    print(f"[上下文已压缩] 删除 {len(removed)} 条旧消息 → 保留 {len(tail)} 条 + 1 条摘要")
+            except Exception as exc:
+                print(f"[上下文压缩失败，回退硬裁剪] {exc}")
+                messages = trim_for_model(messages)
+        elif summary_model is None:
+            messages = trim_for_model(messages)
+        response = model_with_tool.invoke(messages)
         return {
-            "messages": [response]
+            "messages": updates + [response]
         }
     return llm_node
 
