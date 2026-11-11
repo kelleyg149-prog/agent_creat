@@ -116,6 +116,88 @@ def calculater(a: float, b: float):
 
 
 @tool
+def membrane_stats(field: str):
+    """统计所有膜在某个字段上的总体数据（数量、最大值、最小值、平均值）。
+
+    适用问题：膜通量的平均值是多少、离子通量最大是多少、电压有多少种取值等。
+    参数 field 为字段名（膜通量、电压、离子通量）。
+    """
+    membrane = _load_membrane()
+    values = [
+        data[field] for data in membrane.values()
+        if isinstance(data.get(field), (int, float))
+    ]
+    if not values:
+        return {"success": False, "data": None, "error": f"字段「{field}」不存在或无数值，可用字段：膜通量、电压、离子通量"}
+    return {
+        "success": True,
+        "data": {
+            "field": field,
+            "count": len(values),
+            "max": max(values),
+            "min": min(values),
+            "mean": round(sum(values) / len(values), 4),
+        },
+        "error": None
+    }
+
+
+@tool
+def membrane_compare(mem_name1: str, mem_name2: str, field: str):
+    """对比两个膜在指定字段上的数值：返回两者数值、差值，并指出哪一方更高。
+
+    适用问题：GO-1 和 GO-2 哪个膜通量高、GO-2 比 GO-3 的离子通量差多少。
+    """
+    membrane = _load_membrane()
+    m1, m2 = mem_name1.upper(), mem_name2.upper()
+    for name in (m1, m2):
+        if name not in membrane:
+            return {"success": False, "data": None, "error": f"未找到编号 {name}，可用编号：{', '.join(membrane)}"}
+    v1, v2 = membrane[m1].get(field), membrane[m2].get(field)
+    if not isinstance(v1, (int, float)) or not isinstance(v2, (int, float)):
+        return {"success": False, "data": None, "error": f"字段「{field}」不存在或非数值，可用字段：膜通量、电压、离子通量"}
+    return {
+        "success": True,
+        "data": {
+            "field": field,
+            f"{m1}": v1,
+            f"{m2}": v2,
+            "diff": round(v1 - v2, 4),
+            "higher": m1 if v1 > v2 else (m2 if v2 > v1 else "相等"),
+        },
+        "error": None
+    }
+
+
+@tool
+def membrane_top(field: str, n: int = 1, descending: bool = True):
+    """按某字段排序，返回排名前 n 的膜（默认降序 = 数值最高的在前）。
+
+    适用问题：膜通量最高的膜是哪个、离子通量最低的两个膜。
+    n 为返回数量（默认 1），descending=False 时按升序（数值最低的在前）。
+    """
+    membrane = _load_membrane()
+    rows = [
+        {"膜编号": name, "值": data[field]}
+        for name, data in membrane.items()
+        if isinstance(data.get(field), (int, float))
+    ]
+    if not rows:
+        return {"success": False, "data": None, "error": f"字段「{field}」不存在或无数值，可用字段：膜通量、电压、离子通量"}
+    n = max(1, min(int(n), len(rows)))
+    rows.sort(key=lambda r: r["值"], reverse=descending)
+    return {
+        "success": True,
+        "data": {
+            "field": field,
+            "order": "降序" if descending else "升序",
+            "top": rows[:n],
+        },
+        "error": None
+    }
+
+
+@tool
 def rag_search(query: str):
     """在膜分离研究论文资料库中检索并回答与问题最相关的资料（含来源与页码）。
 
@@ -138,4 +220,4 @@ def rag_search(query: str):
     }
 
 
-tools = [membrane_data, calculater, rag_search]
+tools = [membrane_data, membrane_stats, membrane_compare, membrane_top, calculater, rag_search]

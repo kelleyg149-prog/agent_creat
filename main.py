@@ -5,8 +5,9 @@ import openai
 from langgraph.types import Command
 from langchain_core.messages import AIMessage
 
-from config import config
+from config import config, model, store
 from graph import graph
+from memory import extract_and_save_profile
 
 #退出指令（大小写不敏感）
 EXIT_COMMANDS = {"end", "结束"}
@@ -115,7 +116,11 @@ def main():
             print("再见！")
             break
 
-        print("助手：", get_last_ai_text(result))
+        ai_text = get_last_ai_text(result)
+        print("助手：", ai_text)
+
+        #长期记忆：LLM 判定本轮是否产生值得跨会话保存的用户事实（失败不影响主对话）
+        extract_and_save_profile(user_input, ai_text, store, model)
 
 
 if __name__ == "__main__":

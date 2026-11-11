@@ -1,8 +1,9 @@
-#配置：API Key、模型实例、运行参数、checkpointer
+#配置：API Key、模型实例、运行参数、checkpointer、长期记忆 store
 import os
 import sqlite3
 from dotenv import load_dotenv
 from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.store.sqlite import SqliteStore
 from langchain_openai import ChatOpenAI
 
 from tools import tools
@@ -52,6 +53,16 @@ _checkpoint_conn = sqlite3.connect(
     check_same_thread=False
 )
 checkpointer = SqliteSaver(_checkpoint_conn)
+
+#长期记忆 store：跨会话用户画像（独立文件 store.sqlite，换 thread_id 也不丢）
+#SqliteStore 与 SqliteSaver 同包（langgraph-checkpoint-sqlite），复用 sqlite 连接规则
+_store_conn = sqlite3.connect(
+    os.path.join(_checkpoint_dir, "store.sqlite"),
+    check_same_thread=False,
+    isolation_level=None,  # autocommit：SqliteStore 自己管理 BEGIN/COMMIT，避免 setup 后残留事务冲突
+)
+store = SqliteStore(_store_conn)
+store.setup()  #首次运行建表（幂等）
 
 #对话线程配置（同一 thread_id 共享历史；换 thread_id = 开新对话）
 config = {

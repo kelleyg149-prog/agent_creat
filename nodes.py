@@ -6,10 +6,10 @@ from typing import Literal
 from langgraph.types import Command, interrupt
 from langgraph.graph import END
 from langgraph.prebuilt import ToolNode
-from langchain_core.messages import AIMessage, RemoveMessage, ToolMessage
+from langchain_core.messages import AIMessage, RemoveMessage, SystemMessage, ToolMessage
 
 from rag_config import EVIDENCE_VECTOR_THRESHOLD, EVIDENCE_RERANK_THRESHOLD
-from memory import compress_context
+from memory import compress_context, load_profile
 
 
 #工具调用节点工厂：接收工具列表，返回 ToolNode 实例
@@ -106,8 +106,8 @@ def create_check_tool(max_retry):
     return check_tool
 
 
-#llm节点工厂：接收绑定工具的模型、消息窗口大小，可选摘要模型与保留条数
-def create_llm_node(model_with_tool, max_context_messages, summary_model=None, keep_recent=20):
+#llm节点工厂：接收绑定工具的模型、消息窗口大小，可选摘要模型、保留条数与长期记忆 store
+def create_llm_node(model_with_tool, max_context_messages, summary_model=None, keep_recent=20, store=None):
     trim_for_model = create_trim_for_model(max_context_messages)
 
     def llm_node(state):
@@ -115,6 +115,8 @@ def create_llm_node(model_with_tool, max_context_messages, summary_model=None, k
         消息超限时优先压缩（摘要+写回 State 删除旧消息），压缩失败回退硬裁剪。
         返回的 messages 里 RemoveMessage 会按 add_messages 的 reducer 删除对应旧消息，
         摘要 SystemMessage 与模型回复一起追加，保证 State 持续精简。
+        长期记忆（store）在调用前注入：画像 SystemMessage 只拼在本次上下文开头，
+        不写入 State，避免每轮重复堆积。
         """
         messages = state["messages"]
         updates = []
@@ -133,6 +135,12 @@ def create_llm_node(model_with_tool, max_context_messages, summary_model=None, k
                 messages = trim_for_model(messages)
         elif summary_model is None:
             messages = trim_for_model(messages)
+
+        #长期记忆注入：跨会话用户画像（只进本次上下文，不进 State）
+        profile = load_profile(store)
+        if profile:
+            messages = [SystemMessage(content=f"【用户长期记忆】\n{profile}")] + list(messages)
+
         response = model_with_tool.invoke(messages)
         return {
             "messages": updates + [response]

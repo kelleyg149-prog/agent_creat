@@ -26,13 +26,13 @@
 
 | 文件 | 职责 | 状态 |
 |---|---|---|
-| `main.py` | 程序入口：持续对话循环；`safe_invoke()` 限流退避重试（429 后等 5s 重试 3 次）+ 认证/连接/格式/兜底异常友好提示；处理 `interrupt` 挂起的人工审批，循环 resume | 已提交，工作区有未提交改动 |
-| `config.py` | 配置中心：加载 `.env`、创建智谱 GLM-5.3 模型实例、`bind_tools`、`MAX_RETRY=3`、`MAX_CONTEXT_MESSAGES=40`、**`COMPRESS_KEEP_RECENT=20`**、**SQLite checkpointer（`data/checkpoint.sqlite`，跨进程持久化）**、`thread_id` | 工作区有未提交改动 |
-| `graph.py` | LangGraph 图：注册节点（llm / tool_node / check_node / auto_correct / retry / human_check / **evidence_check**）、条件边、`compile(checkpointer)`；`llm_node` 注入摘要模型与压缩保留条数 | 工作区有未提交改动 |
-| `nodes.py` | 全部节点实现（工厂函数模式）：llm（**超限时摘要压缩+RemoveMessage 删旧消息**）/ check_tool / auto_correct / retry / human_check / router / **create_evidence_check（RAG 答案透传：读子图产出的 answer 直接返回，写 State 证据字段）** | 同上 |
-| `memory.py` | **上下文压缩模块**：消息超限时把早期消息用 LLM 压缩成 `[历史摘要]` SystemMessage，返回待删除旧消息列表；含 ToolMessage 配对保护、摘要 prompt（保留身份/偏好/关键数字/待办） | 未入库 |
+| `main.py` | 程序入口：持续对话循环；`safe_invoke()` 限流退避重试（429 后等 5s 重试 3 次）+ 认证/连接/格式/兜底异常友好提示；处理 `interrupt` 挂起的人工审批，循环 resume；**每轮结束调用 `extract_and_save_profile` 抽取长期记忆** | 工作区有未提交改动 |
+| `config.py` | 配置中心：加载 `.env`、创建智谱 GLM-5.3 模型实例、`bind_tools`、`MAX_RETRY=3`、`MAX_CONTEXT_MESSAGES=40`、`COMPRESS_KEEP_RECENT=20`、**SQLite checkpointer（`data/checkpoint.sqlite`）**、**长期记忆 `SqliteStore`（`data/store.sqlite`，autocommit 连接 + `setup()` 建表）**、`thread_id` | 工作区有未提交改动 |
+| `graph.py` | LangGraph 图：注册节点（llm / tool_node / check_node / auto_correct / retry / human_check / **evidence_check**）、条件边、`compile(checkpointer)`；`llm_node` 注入摘要模型、压缩保留条数与**长期记忆 store** | 工作区有未提交改动 |
+| `nodes.py` | 全部节点实现（工厂函数模式）：llm（**超限摘要压缩 + 引入上下文注入长期记忆画像**）/ check_tool / auto_correct / retry / human_check / router / **create_evidence_check（RAG 答案透传：读子图产出的 answer 直接返回，写 State 证据字段）** | 同上 |
+| `memory.py` | **记忆管理模块**：① `compress_context` 上下文压缩（超限 → `[历史摘要]`，RemoveMessage 删旧，ToolMessage 配对保护）② **长期记忆：`extract_and_save_profile`（LLM 按"稳定/可复用/不敏感"三标准抽取 → SqliteStore）+ `load_profile`（读取画像文本）** | 工作区有未提交改动 |
 | `state.py` | `State(MessagesState)` 扩展字段（含 3 个证据字段）+ `init_state()` 统一初始化 | 同上 |
-| `tools.py` | 工具定义：`membrane_data`（**三模式查询**：按编号 / 按字段精确筛选 / 按数值范围；**数据从 `membrane.json` 实时读取**，改数据无需重启）、`calculater`、`rag_search`（**内部调用 RAG 子图 `rag_subgraph`**） | 同上 |
+| `tools.py` | 工具定义（**6 个**）：`membrane_data`（三模式查询：编号/字段精确筛选/数值范围）、**`membrane_stats`（字段统计：count/max/min/mean）**、**`membrane_compare`（两膜字段对比：差值+更高者）**、**`membrane_top`（字段排名 Top-N，可升/降序）**、`calculater`、`rag_search`（内部调用 RAG 子图）；膜数据均从 `membrane.json` 实时读取 | 工作区有未提交改动 |
 | `membrane.json` | 膜数据表（项目资产，**入库**；与 data/ 运行产物分开，后者 gitignored）；不存在时由 `_load_membrane()` 用内置默认首次生成 | 未入库（待 add） |
 | `rag_engine.py` | RAG 检索基础能力：惰性加载 embedding/索引、FAISS 召回、LLM 重排、上下文组装；检索参数引用 `rag_config`；种子文档引用 `seed_documents`；**证据裁决与生成已上移子图，无 rag_search 入口** | 工作区有未提交改动 |
 | `rag_config.py` | **RAG 检索参数集中配置（唯一出处）**：`RAG_CANDIDATE_K=5`、`RAG_RERANK_TOP_N=3`、`EVIDENCE_VECTOR_THRESHOLD=0.6`、`EVIDENCE_RERANK_THRESHOLD=5.0`；独立模块避免循环导入（config→tools→rag_engine） | 未入库 |
@@ -104,16 +104,18 @@ RAG 子图（rag_subgraph，由 rag_search 工具调用）：
 11. **safe_invoke 兜底**：`graph.invoke` 统一封装——限流（429）退避重试 3 次每次 5s，认证/连接/请求格式/兜底异常友好提示返回 None，程序永不因 API 异常崩溃。
 12. **RAG 子图化（SubGraph）**：完整 RAG 管线封装为独立子图（`rag_subgraph.py`，输入 query 输出 answer），`rag_search` 工具调用子图、主图透传答案——主图保持"工具+审批+容错"骨架，检索细节完全封装；子图内证据不足直接产出提示，主图不再需要 no_evidence 节点（已移除）。重排分缺失（<0，重排回退）时退化为只依赖向量信号。
 13. **上下文摘要压缩**：超限时早期消息 → LLM 摘要（`[历史摘要]` 前缀，保留用户身份/偏好、工具结论与关键数字、未完成待办），保留最近 20 条，`RemoveMessage` 从 State 删除旧消息（摘要只做一次）；tail 不以 ToolMessage 开头（配对保护）；失败回退硬裁剪。实测 88 条 → 删 68 条 + 20 条 + 1 条摘要，8 项断言全 PASS。
+14. **三层记忆体系**：① 工作记忆 = State 临时字段（`retry_count` 等，每轮重置）② 会话记忆 = `SqliteSaver`（`checkpoint.sqlite`，按 thread_id 存全量消息，跨进程）③ **长期记忆 = `SqliteStore`（`store.sqlite`，namespace `user_profile`，跨 thread 不丢）**。长期记忆写入由 LLM 按"稳定 / 可复用 / 不敏感"三标准判定抽取（`extract_and_save_profile`，同 key 覆盖更新，失败静默跳过）；读取时由 `llm_node` 把画像拼成 SystemMessage 注入本次上下文——**不进 State**，避免每轮重复堆积。store 连接需 `isolation_level=None`（autocommit），否则 `setup()` 残留事务会让后续 `BEGIN` 报错。
+15. **多工具并行调用**：模型一次返回多个 `tool_calls`（GLM-5.3 已实测支持），`human_check` 按序号列表一次审批全部，`ToolNode` 并行执行，`check_node` 收集连续 `ToolMessage` 统一校验。部分失败时走既有容错链：`auto_correct` 让模型判断（如编号不存在则放弃重试、直接说明），不会重复执行已成功的工具。审批改参限制：仅 `membrane_data` 支持「序号 新编号」，其他工具只支持 yes/no。
 
 ## 6. 当前进度（git 脉络）
 
 已提交：`Initial commit` → gitignore → class state LangGraph → **模块化拆分**（`refactor/modularize` 分支）→ merge → 增加 rag 并接入 → **更换 api**（智谱）→ **增加兜底函数**（safe_invoke）。
 
 未入库的工作区改动：
-- `M`：`evaluate_rag.py`、`graph.py`、`nodes.py`、`config.py`、`rag-test.py`、`rag_engine.py`、`tools.py`、`PROJECT_SUMMARY.md`（参数集中 + 膜数据外置 + 种子去重 + RAG 子图化 + SQLite 持久化 + 上下文压缩）
-- `??`：`rag_config.py`（RAG 参数配置模块）、`rag_subgraph.py`（RAG 子图）、`memory.py`（上下文压缩）、`membrane.json`（膜数据）、`seed_documents.py`（种子文档共享模块）
+- `M`：`main.py`、`config.py`、`graph.py`、`nodes.py`、`memory.py`、`tools.py`、`evaluate_rag.py`、`rag-test.py`、`rag_engine.py`、`PROJECT_SUMMARY.md`（参数集中 + 膜数据外置 + 种子去重 + RAG 子图化 + SQLite 持久化 + 上下文压缩 + 长期记忆 + 多工具并行）
+- `??`：`rag_config.py`（RAG 参数配置模块）、`rag_subgraph.py`（RAG 子图）、`membrane.json`（膜数据）、`seed_documents.py`（种子文档共享模块）
 
-已完成能力：模块化 LangGraph 图、工具审批流、三级失败容错、**上下文摘要压缩（超限压缩+失败回退裁剪）**、**SQLite 持久化记忆（跨进程不丢）**、RAG 全链路（召回→重排→证据检查→生成/提示，已子图化）、检索质量评估、膜数据三模式查询、API 异常兜底、RAG 参数集中配置、膜数据外置、种子文档去重。
+已完成能力：模块化 LangGraph 图、工具审批流（**支持多工具一次审批**）、**6 个业务工具（查询/统计/对比/排名/计算/检索）**、三级失败容错、上下文摘要压缩（超限压缩+失败回退裁剪）、SQLite 持久化会话记忆（跨进程不丢）、长期记忆（跨会话用户画像，三标准抽取+注入）、RAG 全链路（召回→重排→证据检查→生成/提示，已子图化）、检索质量评估、API 异常兜底、RAG 参数集中配置、膜数据外置、种子文档去重。
 
 ## 7. RAG 链路优化进度
 
@@ -133,6 +135,8 @@ RAG 子图（rag_subgraph，由 rag_search 工具调用）：
 12. **种子文档去重**：`SEED_DOCUMENTS` 从 `rag-test.py` 与 `rag_engine.py` 两处抽出，统一到 `seed_documents.py` 共享模块（已验证两处引用同一对象，杜绝两份种子漂移）。
 13. **RAG 子图化**：完整 RAG 管线封装为独立 SubGraph（`rag_subgraph.py`：retrieve → evidence_check → generate/no_evidence，输入 query 输出 answer），`rag_search` 工具调用子图，主图 `evidence_check` 透传 answer 并写 State 字段，主图 `no_evidence` 节点移除。子图独立单测：正例（向量 0.778/重排 10.0）生成答案、无关 query（向量 0.446/重排 0.0）双信号拦截出提示（顺带修复旧 0.4 阈值下的「锂电池」误放行）；主图三场景（正例直出答案 / pKa 提示 / GO-2 走 llm）实测通过。
 14. **上下文摘要压缩**：新增 `memory.py`，消息超 `MAX_CONTEXT_MESSAGES=40` 时把早期消息压缩成 `[历史摘要]`（保留用户身份/偏好、工具结论与关键数字、未完成待办），保留最近 `COMPRESS_KEEP_RECENT=20` 条，`RemoveMessage` 从 State 删除旧消息 → 摘要只做一次、State 持续精简；tail 不以 ToolMessage 开头（配对保护）；压缩失败回退硬裁剪。单测 88 条 → 删 68 条 + 20 条 + 1 条摘要，8 项断言全 PASS；主图正常工具链路回归通过。
+15. **长期记忆（跨会话用户画像）**：`SqliteStore`（`data/store.sqlite`，namespace `user_profile`）存用户稳定事实；写入 = `extract_and_save_profile`（LLM 按"稳定/可复用/不敏感"三标准抽取，同 key 覆盖，失败静默跳过），读取 = `llm_node` 注入画像 SystemMessage（不进 State）。实测：thread 1 说身份 → 抽取 `name / major / research_direction` 三条；**thread 2 全新会话**正确答出"金阿奎、资源与环境研究生、GO膜去除SMX"；负例"查一下GO-2"未写入；main.py 端到端正常。
+16. **多工具并行调用 + 工具扩容**：新增 3 个膜数据工具（`membrane_stats` 统计 / `membrane_compare` 对比 / `membrane_top` 排名），工具总数 6；一句复合问题实测触发 3 个 `tool_calls` → 一次审批列出 `[1][2][3]` → 并行执行 → 汇总回答正确（均值 20.0、GO-2 高于 GO-1、GO-3 最高）；部分失败场景（GO-2 成功 + GO-99 失败）由 auto_correct 判定"编号不存在"直接自然语言说明，未重复执行成功工具。工具单测含错误用例（不存在字段/编号）全部通过。
 
 ### 待办
 
@@ -157,12 +161,12 @@ RAG 子图（rag_subgraph，由 rag_search 工具调用）：
 ```
 
 退出指令：`end` / `END` / `结束`（大小写不敏感）。
-审批指令：`yes` 批准 / `no` 拒绝 / `「序号 新膜编号」` 修改参数后执行（如 `1 GO-2`）。
+审批指令：`yes` 批准（一次批准该组全部工具） / `no` 拒绝 / `「序号 新膜编号」` 修改参数后执行（如 `1 GO-2`；仅 `membrane_data` 支持，其他工具只支持 yes/no）。
 
 ## 9. 注意事项
 
 - `.env` 含真实 API Key，**禁止**提交入库（已在 `.gitignore`）。
-- `data/` 为运行产物（FAISS 索引 + 文档元数据 + **`checkpoint.sqlite` 对话历史**），可重建/可清空，已在 `.gitignore` 排除；删除 `checkpoint.sqlite` 即清空跨进程记忆（含对话内容，注意隐私）。
+- `data/` 为运行产物（FAISS 索引 + 文档元数据 + **`checkpoint.sqlite` 对话历史** + **`store.sqlite` 长期记忆**），可重建/可清空，已在 `.gitignore` 排除；删除 `checkpoint.sqlite` 清空会话记忆（换 thread_id 即开新对话），删除 `store.sqlite` 清空长期用户画像（注意隐私：两文件都含对话/个人信息）。
 - 本机无法直连 huggingface.co，embedding 模型加载依赖 `HF_HUB_OFFLINE=1` 使用本地缓存；重排使用 LLM-as-Reranker（本地无 cross-encoder 模型）。
 - 智谱 API：GLM-5.3 强制思考不可关（`thinking.type=disabled` 会直接报错）；免费档有 RPM 限制（GLM-4-Flash 约 50 RPM），`safe_invoke` 已做 429 退避。
 - 环境为 Windows；命令使用 PowerShell / `.venv\Scripts\python.exe`。
