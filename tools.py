@@ -1,8 +1,11 @@
 #所有工具定义
 import json
 import os
+from typing import Annotated
 
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import tool
+from langgraph.prebuilt import InjectedState
 
 from rag_subgraph import rag_subgraph
 
@@ -197,19 +200,73 @@ def membrane_top(field: str, n: int = 1, descending: bool = True):
     }
 
 
+#========== 多轮对话式检索（query 改写） ==========
+
+_REWRITE_PROMPT = (
+    "你是检索查询改写助手。根据下面的对话历史，把用户最新的检索问题改写成一个"
+    "不依赖上下文、可独立检索的完整问题。\n"
+    "规则：\n"
+    "1) 若最新问题本身已完整（无「它/这个/那/其中」等指代），原样返回；\n"
+    "2) 若存在指代，把对话历史中的主题（膜材料、污染物、机理名称等）补全进问题；\n"
+    "3) 保留专业术语与关键实体，不要添加历史中没有的信息；\n"
+    "4) 只输出改写后的问题本身，不要解释、不要加引号。"
+)
+
+
+def _recent_dialog(state, max_lines=8):
+    """从 state.messages 提取最近的用户/助手文本（跳过 tool 与空内容）。"""
+    if not state:
+        return ""
+    lines = []
+    for msg in state.get("messages") or []:
+        msg_type = getattr(msg, "type", "")
+        content = getattr(msg, "content", "")
+        if msg_type == "human" and content:
+            lines.append(f"用户：{content}")
+        elif msg_type == "ai" and content:
+            lines.append(f"助手：{content}")
+    return "\n".join(lines[-max_lines:])
+
+
+def _rewrite_query(query, state):
+    """多轮对话式检索：结合历史把追问改写为独立完整 query；无历史或失败时原样返回。"""
+    history = _recent_dialog(state)
+    if not history:
+        return query
+    try:
+        from config import model  # 延迟导入：config → tools 存在依赖，运行时 config 已加载
+        resp = model.invoke([
+            SystemMessage(content=_REWRITE_PROMPT),
+            HumanMessage(content=f"对话历史：\n{history}\n\n最新检索问题：{query}\n\n改写结果："),
+        ])
+        rewritten = resp.content.strip() if isinstance(resp.content, str) else str(resp.content).strip()
+        if not rewritten or len(rewritten) > 200:
+            return query
+        if rewritten != query:
+            print(f"[查询改写] {query} → {rewritten}")
+        return rewritten
+    except Exception as exc:
+        print(f"[查询改写失败，使用原 query] {exc}")
+        return query
+
+
 @tool
-def rag_search(query: str):
+def rag_search(query: str, state: Annotated[dict, InjectedState]):
     """在膜分离研究论文资料库中检索并回答与问题最相关的资料（含来源与页码）。
 
     适用于论文资料、机理机制、表征方法、研究结论等研究类问题，
     例如"为什么提高pH可能增强SMX截留？"。
+    支持多轮对话式检索：追问可以带指代（如"那静电排斥起什么作用？"），
+    工具会结合对话历史把问题改写为独立完整的检索问题后再检索。
     内部由 RAG 子图完成：召回 → 重排 → 证据检查 → 生成答案（或证据不足时给出提示）。
     """
-    result = rag_subgraph.invoke({"query": query})
+    rewritten = _rewrite_query(query, state)
+    result = rag_subgraph.invoke({"query": rewritten})
     return {
         "success": True,
         "data": {
             "answer": result["answer"],
+            "rewritten_query": rewritten,
             "top_vector_score": float(result["vector_score"]),
             "top_rerank_score": float(result["rerank_score"]),
             "evidence_ok": bool(result["evidence_ok"]),

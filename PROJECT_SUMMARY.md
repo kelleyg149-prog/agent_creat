@@ -32,7 +32,7 @@
 | `nodes.py` | 全部节点实现（工厂函数模式）：llm（**超限摘要压缩 + 引入上下文注入长期记忆画像**）/ check_tool / auto_correct / retry / human_check / router / **create_evidence_check（RAG 答案透传：读子图产出的 answer 直接返回，写 State 证据字段）** | 同上 |
 | `memory.py` | **记忆管理模块**：① `compress_context` 上下文压缩（超限 → `[历史摘要]`，RemoveMessage 删旧，ToolMessage 配对保护）② **长期记忆：`extract_and_save_profile`（LLM 按"稳定/可复用/不敏感"三标准抽取 → SqliteStore）+ `load_profile`（读取画像文本）** | 工作区有未提交改动 |
 | `state.py` | `State(MessagesState)` 扩展字段（含 3 个证据字段）+ `init_state()` 统一初始化 | 同上 |
-| `tools.py` | 工具定义（**6 个**）：`membrane_data`（三模式查询：编号/字段精确筛选/数值范围）、**`membrane_stats`（字段统计：count/max/min/mean）**、**`membrane_compare`（两膜字段对比：差值+更高者）**、**`membrane_top`（字段排名 Top-N，可升/降序）**、`calculater`、`rag_search`（内部调用 RAG 子图）；膜数据均从 `membrane.json` 实时读取 | 工作区有未提交改动 |
+| `tools.py` | 工具定义（**6 个**）：`membrane_data`（三模式查询：编号/字段精确筛选/数值范围）、**`membrane_stats`（字段统计：count/max/min/mean）**、**`membrane_compare`（两膜字段对比：差值+更高者）**、**`membrane_top`（字段排名 Top-N，可升/降序）**、`calculater`、`rag_search`（内部调用 RAG 子图；**支持多轮对话式检索：`InjectedState` 取对话历史 → `_rewrite_query` 把带指代的追问改写为独立 query**）；膜数据均从 `membrane.json` 实时读取 | 工作区有未提交改动 |
 | `membrane.json` | 膜数据表（项目资产，**入库**；与 data/ 运行产物分开，后者 gitignored）；不存在时由 `_load_membrane()` 用内置默认首次生成 | 未入库（待 add） |
 | `rag_engine.py` | RAG 检索基础能力：惰性加载 embedding/索引、FAISS 召回、LLM 重排、上下文组装；检索参数引用 `rag_config`；种子文档引用 `seed_documents`；**证据裁决与生成已上移子图，无 rag_search 入口** | 工作区有未提交改动 |
 | `rag_config.py` | **RAG 检索参数集中配置（唯一出处）**：`RAG_CANDIDATE_K=5`、`RAG_RERANK_TOP_N=3`、`EVIDENCE_VECTOR_THRESHOLD=0.6`、`EVIDENCE_RERANK_THRESHOLD=5.0`；独立模块避免循环导入（config→tools→rag_engine） | 未入库 |
@@ -106,6 +106,7 @@ RAG 子图（rag_subgraph，由 rag_search 工具调用）：
 13. **上下文摘要压缩**：超限时早期消息 → LLM 摘要（`[历史摘要]` 前缀，保留用户身份/偏好、工具结论与关键数字、未完成待办），保留最近 20 条，`RemoveMessage` 从 State 删除旧消息（摘要只做一次）；tail 不以 ToolMessage 开头（配对保护）；失败回退硬裁剪。实测 88 条 → 删 68 条 + 20 条 + 1 条摘要，8 项断言全 PASS。
 14. **三层记忆体系**：① 工作记忆 = State 临时字段（`retry_count` 等，每轮重置）② 会话记忆 = `SqliteSaver`（`checkpoint.sqlite`，按 thread_id 存全量消息，跨进程）③ **长期记忆 = `SqliteStore`（`store.sqlite`，namespace `user_profile`，跨 thread 不丢）**。长期记忆写入由 LLM 按"稳定 / 可复用 / 不敏感"三标准判定抽取（`extract_and_save_profile`，同 key 覆盖更新，失败静默跳过）；读取时由 `llm_node` 把画像拼成 SystemMessage 注入本次上下文——**不进 State**，避免每轮重复堆积。store 连接需 `isolation_level=None`（autocommit），否则 `setup()` 残留事务会让后续 `BEGIN` 报错。
 15. **多工具并行调用**：模型一次返回多个 `tool_calls`（GLM-5.3 已实测支持），`human_check` 按序号列表一次审批全部，`ToolNode` 并行执行，`check_node` 收集连续 `ToolMessage` 统一校验。部分失败时走既有容错链：`auto_correct` 让模型判断（如编号不存在则放弃重试、直接说明），不会重复执行已成功的工具。审批改参限制：仅 `membrane_data` 支持「序号 新编号」，其他工具只支持 yes/no。
+16. **多轮对话式检索放在工具层（双保险）**：`rag_search` 用 `InjectedState` 读对话历史做 query 改写（`_rewrite_query`：追问 → 独立完整 query），子图保持"纯检索管线"职责不变。选择工具层而非子图内的原因：① 对话历史只有工具能拿到（`InjectedState` 由 ToolNode 注入，schema 对模型仍只暴露 `query`）② 子图不该关心"对话有几轮"，换入口复用不受影响。模型自身也会补全指代，工具层是兜底保证；改写失败/空/超长回退原 query，不阻断检索。
 
 ## 6. 当前进度（git 脉络）
 
@@ -137,12 +138,13 @@ RAG 子图（rag_subgraph，由 rag_search 工具调用）：
 14. **上下文摘要压缩**：新增 `memory.py`，消息超 `MAX_CONTEXT_MESSAGES=40` 时把早期消息压缩成 `[历史摘要]`（保留用户身份/偏好、工具结论与关键数字、未完成待办），保留最近 `COMPRESS_KEEP_RECENT=20` 条，`RemoveMessage` 从 State 删除旧消息 → 摘要只做一次、State 持续精简；tail 不以 ToolMessage 开头（配对保护）；压缩失败回退硬裁剪。单测 88 条 → 删 68 条 + 20 条 + 1 条摘要，8 项断言全 PASS；主图正常工具链路回归通过。
 15. **长期记忆（跨会话用户画像）**：`SqliteStore`（`data/store.sqlite`，namespace `user_profile`）存用户稳定事实；写入 = `extract_and_save_profile`（LLM 按"稳定/可复用/不敏感"三标准抽取，同 key 覆盖，失败静默跳过），读取 = `llm_node` 注入画像 SystemMessage（不进 State）。实测：thread 1 说身份 → 抽取 `name / major / research_direction` 三条；**thread 2 全新会话**正确答出"金阿奎、资源与环境研究生、GO膜去除SMX"；负例"查一下GO-2"未写入；main.py 端到端正常。
 16. **多工具并行调用 + 工具扩容**：新增 3 个膜数据工具（`membrane_stats` 统计 / `membrane_compare` 对比 / `membrane_top` 排名），工具总数 6；一句复合问题实测触发 3 个 `tool_calls` → 一次审批列出 `[1][2][3]` → 并行执行 → 汇总回答正确（均值 20.0、GO-2 高于 GO-1、GO-3 最高）；部分失败场景（GO-2 成功 + GO-99 失败）由 auto_correct 判定"编号不存在"直接自然语言说明，未重复执行成功工具。工具单测含错误用例（不存在字段/编号）全部通过。
+17. **RAG 多轮对话式检索（query 改写）**：`rag_search` 增加 `state: Annotated[dict, InjectedState]`（ToolNode 自动注入对话历史，schema 对模型只暴露 `query`），检索前用 `_rewrite_query` 结合最近对话把带指代的追问改写成独立完整 query，再送入 RAG 子图；返回新增 `rewritten_query` 字段便于观察。改写失败/为空/超长 → 回退原 query（不阻断检索）。单测：`"那静电排斥在其中起什么作用？"` → `"静电排斥在提高pH增强SMX截留过程中起什么作用？"`；完整问题与无历史场景均原样返回。端到端两轮：轮1 问 pH/SMX 机理（命中 paper_01 3.3/3.4 节），轮2 追问"静电排斥起什么作用"→ 检索 query 已带完整上下文，答案连贯承接轮1 结论。
 
 ### 待办
 
 1. **证据阈值调优**：若后续要堵弱相关误放行，可再评估提高阈值或引入更多无关负例（0.6 下「锂电池」已正确拦截）。
 2. **膜数据管理入口**：可仿照 `rag-test.py --add` 提供膜数据的命令行增删改入口（当前直接编辑 JSON 即可）。
-3. **主图子图并行化**：后续可探索主图直接挂 RAG 子图节点（跳过工具调用层）或支持多工具并行调用。
+3. **主图子图并行化**：后续可探索主图直接挂 RAG 子图节点（跳过工具调用层）。
 
 ## 8. 运行方式
 
